@@ -75,5 +75,26 @@ def get_model(model_name, args):
     elif name == "tagfex":
         from models.tagfex import TagFex
         return TagFex(args)
+    
+    #=== Machine Unlearning　を考慮したモデル ===#
+    elif name == "baseline-mu":
+        from models.baseline_mu import BaselineMu
+        return BaselineMu(args)
+    elif name == "icarl-mu":
+        from models.icarl_mu import iCaRLMU
+        return iCaRLMU(args)
+    elif name == "der-mu":
+        from models.der_mu import DERMU
+        return DERMU(args)
+    elif name == "foster-mu":
+        from models.foster_mu import FOSTERMU
+        return FOSTERMU(args)
+    elif name == "tagfex-mu":
+        from models.tagfex_mu import TagFexMU
+        return TagFexMU(args)
+    elif name == "prl-mu":
+        from models.prl_mu import PRLMU
+        return PRLMU(args)
+
     else:
         assert 0

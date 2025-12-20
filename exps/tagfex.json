@@ -1,5 +1,5 @@
 {
-    "prefix": "reproduce",
+    "prefix": "reproduce2",
     "dataset": "cifar100_aa",
     "memory_size": 2000,
     "memory_per_class": 20,
@@ -8,8 +8,8 @@
     "init_cls": 10,
     "increment": 10,
     "model_name": "tagfex",
-    "convnet_type": "resnet18",
-    "device": ["0"],
+    "convnet_type": "resnet32",
+    "device": ["2"],
     "seed": [1993],
     "init_interpolation_factor": 0.95,
     "infonce_temp":0.2,

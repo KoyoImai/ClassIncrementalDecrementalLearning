@@ -6,7 +6,7 @@ from trainer import train
 def main():
     args = setup_parser().parse_args()
     param = load_json(args.config)
-    args = vars(args)  # Converting argparse Namespace to a dict.
+    args = vars(args)   # Converting argparse Namespace to a dict.
     args.update(param)  # Add parameters from json
 
     train(args)

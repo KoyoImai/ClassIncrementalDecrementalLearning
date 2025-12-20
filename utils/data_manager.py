@@ -9,13 +9,25 @@ import torch
 
 class DataManager(object):
     def __init__(self, dataset_name, shuffle, seed, init_cls, increment, aug=1):
+        
+        # データセット名
         self.dataset_name = dataset_name
+
+        # データ拡張
         self.aug = aug
+        
+        # 実際にデータセットをダウンロードしている箇所
         self._setup_data(dataset_name, shuffle, seed)
         assert init_cls <= len(self._class_order), "No enough classes."
+
+        # 最初のタスクのクラス数をリストに格納
         self._increments = [init_cls]
+
+        # 追加タスクのクラス数を順番に格納
         while sum(self._increments) + increment < len(self._class_order):
             self._increments.append(increment)
+        
+        # 割り切れない数のクラス数を端数としてリストに格納
         offset = len(self._class_order) - sum(self._increments)
         if offset > 0:
             self._increments.append(offset)
@@ -199,7 +211,7 @@ class DataManager(object):
         self._test_trsf = idata.test_trsf
         self._common_trsf = idata.common_trsf
 
-        # Order
+        # 学習順序の決定
         order = [i for i in range(len(np.unique(self._train_targets)))]
         if shuffle:
             np.random.seed(seed)

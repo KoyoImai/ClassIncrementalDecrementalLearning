@@ -1,4 +1,5 @@
 {
+    "log": "debug",
     "prefix": "reproduce",
     "dataset": "cifar100",
     "memory_size": 2000,
@@ -9,7 +10,7 @@
     "increment": 10,
     "model_name": "icarl",
     "convnet_type": "resnet32",
-    "device": ["0","1","2","3"],
+    "device": ["3"],
     "seed": [1993]
 }
 

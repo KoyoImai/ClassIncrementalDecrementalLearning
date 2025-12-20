@@ -35,7 +35,7 @@ class Replay(BaseLearner):
         super().__init__(args)
         self._network = IncrementalNet(args, False)
 
-    def after_task(self):
+    def after_task(self, log_dir=None):
         self._known_classes = self._total_classes
         logging.info("Exemplar size: {}".format(self.exemplar_size))
 

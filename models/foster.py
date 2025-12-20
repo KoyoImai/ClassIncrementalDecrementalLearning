@@ -1,3 +1,4 @@
+import copy
 import logging
 import numpy as np
 from tqdm import tqdm
@@ -30,9 +31,36 @@ class FOSTER(BaseLearner):
         self.wa_value = args["wa_value"]
         self.oofc = args["oofc"].lower()
 
-    def after_task(self):
+    #---------------------------------------------------------------------------------------
+    # タスク後の処理
+    #---------------------------------------------------------------------------------------
+    def after_task(self, log_dir=None):
+        self._old_network = self._network.copy().freeze()
         self._known_classes = self._total_classes
         logging.info("Exemplar size: {}".format(self.exemplar_size))
+
+        #=== モデルの保存 ===#
+        filename = f"{log_dir}phase"
+        self.save_checkpoint(filename)
+    
+    def save_checkpoint(self, filename):
+        # 既存BaseLearner互換：CPUに落として保存
+        self._network.cpu()
+
+        save_dict = {
+            "tasks": self._cur_task,
+            "model_state_dict": self._network.state_dict(),
+            "forget_classes": copy.deepcopy(getattr(self, "forget_classes", [])),
+        }
+
+        # 要らなければ後でコメントアウト
+        if hasattr(self, "_forget_class_means"):
+            save_dict["forget_class_means"] = copy.deepcopy(self._forget_class_means)
+        if hasattr(self, "_forget_class_targets"):
+            save_dict["forget_class_targets"] = copy.deepcopy(self._forget_class_targets)
+
+        torch.save(save_dict, "{}_{}.pkl".format(filename, self._cur_task))
+
 
     def incremental_train(self, data_manager):
         self.data_manager = data_manager
@@ -143,6 +171,8 @@ class FOSTER(BaseLearner):
                         ] = torch.tensor(0.0)
             elif self.oofc != "ft":
                 assert 0, "not implemented"
+            
+            # 2タスク目以降の学習
             self._feature_boosting(train_loader, test_loader, optimizer, scheduler)
             if self.is_teacher_wa:
                 self._network_module_ptr.weight_align(

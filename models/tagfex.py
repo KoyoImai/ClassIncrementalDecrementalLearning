@@ -1,6 +1,7 @@
 # Please note that only "cifar100_aa" and "cifar10_aa" are supported for TagFex in PyCIL.
 # For large datasets like ImageNet, please refer to the offical code repo https://github.com/bwnzheng/TagFex_CVPR2025.
 import logging
+import copy
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -36,11 +37,45 @@ class TagFex(BaseLearner):
         super().__init__(args)
         self._network = TagFexNet(args, False)
 
-    def after_task(self):
+    # def after_task(self):
+    #     self._known_classes = self._total_classes
+    #     self.last_ta_net = self._network.get_freezed_copy_ta()
+    #     self.last_projector = self._network.get_freezed_copy_projector()
+    #     logging.info("Exemplar size: {}".format(self.exemplar_size))
+
+    #---------------------------------------------------------------------------------------
+    # タスク後の処理
+    #---------------------------------------------------------------------------------------
+    def after_task(self, log_dir=None):
+        # self._old_network = self._network.copy().freeze()
         self._known_classes = self._total_classes
         self.last_ta_net = self._network.get_freezed_copy_ta()
         self.last_projector = self._network.get_freezed_copy_projector()
         logging.info("Exemplar size: {}".format(self.exemplar_size))
+        logging.info("Exemplar size: {}".format(self.exemplar_size))
+
+        #=== モデルの保存 ===#
+        filename = f"{log_dir}phase"
+        self.save_checkpoint(filename)
+    
+    def save_checkpoint(self, filename):
+        # 既存BaseLearner互換：CPUに落として保存
+        self._network.cpu()
+
+        save_dict = {
+            "tasks": self._cur_task,
+            "model_state_dict": self._network.state_dict(),
+            "forget_classes": copy.deepcopy(getattr(self, "forget_classes", [])),
+        }
+
+        # 要らなければ後でコメントアウト
+        if hasattr(self, "_forget_class_means"):
+            save_dict["forget_class_means"] = copy.deepcopy(self._forget_class_means)
+        if hasattr(self, "_forget_class_targets"):
+            save_dict["forget_class_targets"] = copy.deepcopy(self._forget_class_targets)
+
+        torch.save(save_dict, "{}_{}.pkl".format(filename, self._cur_task))
+
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -211,10 +246,12 @@ class TagFex(BaseLearner):
                 inputs = torch.cat([inputs1, inputs2], dim=0)
                 targets = torch.cat([targets, targets], dim=0)
                 
+                #=== model にサンプルを入力して outputs を取得 ===#
                 outputs = self._network(inputs)
                 logits, aux_logits = outputs["logits"], outputs["aux_logits"]
                 embedding = outputs['embedding']
 
+                #=== 損失計算 ===#
                 infonce_loss = infoNCE_loss(embedding, self.args['infonce_temp'])
                 loss_clf = F.cross_entropy(logits, targets)
                 aux_targets = targets.clone()

@@ -21,33 +21,40 @@ def train(args):
 
 def _train(args):
 
+    #=== log name の決定 ===#
     init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
-    logs_name = "logs/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
-    
-    if not os.path.exists(logs_name):
-        os.makedirs(logs_name)
+    log = "baseline" if "log" not in args else args["log"]
+    # logs_name = "logs/{}/{}/{}/{}/{}".format(log, args["model_name"],args["dataset"], init_cls, args['increment'])
 
-    logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
+    #=== log の設定 ===#
+    log_dir = "logs/{}/{}/{}/{}/{}/{}_{}_{}/".format(
         args["model_name"],
+        log,
         args["dataset"],
         init_cls,
         args["increment"],
-        args["prefix"],
-        args["seed"],
-        args["convnet_type"],
+        args["prefix"], args["seed"], args["convnet_type"],
     )
+    
+    #=== log デイレク取りを作成 ===#
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(filename)s] => %(message)s",
         handlers=[
-            logging.FileHandler(filename=logfilename + ".log"),
+            logging.FileHandler(filename=log_dir + "exp.log"),
             logging.StreamHandler(sys.stdout),
         ],
     )
 
+    #=== seed 値の固定 ===#
     _set_random()
     _set_device(args)
     print_args(args)
+
+    #=== data manager の設定 ===#
     data_manager = DataManager(
         args["dataset"],
         args["shuffle"],
@@ -56,20 +63,32 @@ def _train(args):
         args["increment"],
         args["aug"] if "aug" in args else 1
     )
+
+    #=== model の作成 ===#
     model = factory.get_model(args["model_name"], args)
 
+
+    #=== 精度の記録用変数を初期化 ===#
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
     cnn_matrix, nme_matrix = [], []
 
+    #=== タスク毎に順番に学習 ===#
     for task in range(data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
+        
+        #=== 学習の実行 ===#
         model.incremental_train(data_manager)
+        
+        #=== 評価の実行 ===#
         cnn_accy, nme_accy = model.eval_task()
-        model.after_task()
+        
+        #=== タスク終了後の処理 ===#
+        model.after_task(log_dir)
 
+        #=== 精度の表示 ===#
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
             logging.info("NME: {}".format(nme_accy["grouped"]))
@@ -127,8 +146,11 @@ def _train(args):
             np_acctable[idxx, :idxy] = np.array(line)
         np_acctable = np_acctable.T
         forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
+        
         print('Accuracy Matrix (CNN):')
         print(np_acctable)
+        logging.info('Accuracy Matrix (CNN): {}'.format(np_acctable))
+
         print('Forgetting (CNN):', forgetting)
         logging.info('Forgetting (CNN): {}'.format(forgetting))
     if len(nme_matrix)>0:
@@ -140,6 +162,8 @@ def _train(args):
         forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
         print('Accuracy Matrix (NME):')
         print(np_acctable)
+        logging.info('Accuracy Matrix (NME): {}'.format(np_acctable))
+
         print('Forgetting (NME):', forgetting)
         logging.info('Forgetting (NME): {}'.format(forgetting))
 

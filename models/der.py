@@ -35,9 +35,14 @@ class DER(BaseLearner):
         super().__init__(args)
         self._network = DERNet(args, False)
 
-    def after_task(self):
+    def after_task(self, log_dir=None):
+        self._old_network = self._network.copy().freeze()
         self._known_classes = self._total_classes
         logging.info("Exemplar size: {}".format(self.exemplar_size))
+
+        #=== モデルの保存 ===#
+        filename = f"{log_dir}phase"
+        self.save_checkpoint(filename)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -166,6 +171,7 @@ class DER(BaseLearner):
                     train_acc,
                 )
             prog_bar.set_description(info)
+            logging.info(info)
 
         logging.info(info)
 
@@ -227,4 +233,5 @@ class DER(BaseLearner):
                     train_acc,
                 )
             prog_bar.set_description(info)
+            logging.info(info)
         logging.info(info)
