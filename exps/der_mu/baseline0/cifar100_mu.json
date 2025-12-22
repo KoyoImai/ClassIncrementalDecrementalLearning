@@ -1,5 +1,5 @@
 {
-    "log": "baseline00",
+    "log": "baseline0",
     "prefix": "cidl0",
     "dataset": "cifar100",
     "memory_size": 2000,
@@ -39,7 +39,7 @@
     "seed": [1993],
     "num_workers": 8,
     "phase_id": 9,
-    "pra_num_samples_per_class": 5,
+    "pra_num_samples_per_class": 50,
     "pra_alpha": 0.8,
     "proto_n": 5,
     "proto_metric": "sqeuclidean",
