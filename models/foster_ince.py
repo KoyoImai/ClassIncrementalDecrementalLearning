@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from scipy.spatial.distance import cdist
 from models.base import BaseLearner
-from utils.inc_net import FOSTERNet
+from utils.inc_net import INCE_FOSTERNet
 from utils.toolkit import count_parameters, target2onehot, tensor2numpy
 
 # Please refer to https://github.com/G-U-N/ECCV22-FOSTER for the full source code to reproduce foster.
@@ -17,12 +17,12 @@ from utils.toolkit import count_parameters, target2onehot, tensor2numpy
 EPSILON = 1e-8
 
 
-class FOSTERMU(BaseLearner):
+class FOSTERINCE(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
 
-        self._network = FOSTERNet(args, False)
+        self._network = INCE_FOSTERNet(args, False)
 
         # Machine Unleaning パラメータ
         self.forget_list = args["forget_cls"]   # タスク毎の忘却予定リスト
@@ -304,27 +304,37 @@ class FOSTERMU(BaseLearner):
 
             #=== 記録用変数の初期化 ===#
             losses = 0.0
+            losses_clf = 0.0
+            losses_ince = 0.0
             correct = 0
             total = 0
 
             #=== 1エポックの学習 ===#
-            for i, (_, inputs, targets) in enumerate(train_loader):
+            for i, (_, inputs1, inputs2, targets) in enumerate(train_loader):
                 
                 # ----------------------------------------
                 # ① 現在タスクのバッチを gpu に載せる
                 # ----------------------------------------
-                inputs = inputs.to(self._device)
+                inputs1 = inputs1.to(self._device)
+                inputs2 = inputs2.to(self._device)
                 targets = targets.to(self._device)
+                inputs = torch.cat([inputs1, inputs2], dim=0)
+                targets = torch.cat([targets, targets], dim=0)
 
                 # ----------------------------------------
                 # ② Forward 処理
                 # ----------------------------------------
-                logits = self._network(inputs)["logits"]
+                out = self._network(inputs)
+                logits = out["logits"]
+                embedding = out["embedding"]
 
                 # ----------------------------------------
                 # ③ 損失計算
                 # ----------------------------------------
-                loss = F.cross_entropy(logits, targets)
+                loss_clf = F.cross_entropy(logits, targets)
+                infonce_loss = infoNCE_loss(embedding, self.args['infonce_temp'])
+
+                loss = loss_clf + infonce_loss * self.args['contrast_factor']
 
                 # ----------------------------------------
                 # ④ 最適化処理
@@ -333,6 +343,8 @@ class FOSTERMU(BaseLearner):
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
+                losses_clf += loss_clf.item()
+                losses_ince += infonce_loss.item()
 
                 # ----------------------------------------
                 # ⑤ 訓練精度の計算
@@ -346,20 +358,24 @@ class FOSTERMU(BaseLearner):
 
             if epoch % 5 == 0:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_ince {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     self.init_epochs,
                     losses / len(train_loader),
+                    losses_clf / len(train_loader),
+                    losses_ince / len(train_loader),
                     train_acc,
                     test_acc,
                 )
             else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_ince {:.3f}, Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     self.init_epochs,
                     losses / len(train_loader),
+                    losses_clf / len(train_loader),
+                    losses_ince / len(train_loader),
                     train_acc,
                 )
 
@@ -384,24 +400,28 @@ class FOSTERMU(BaseLearner):
             losses_fe = 0.0
             losses_kd = 0.0
             losses_forg = 0.0
+            losses_ince = 0.0
 
             correct = 0.
             total = 0.
 
             #=== 1エポックの学習 ===#
-            for i, (_, inputs, targets) in enumerate(train_loader):
+            for i, (_, inputs1, inputs2, targets) in enumerate(train_loader):
 
                 # ----------------------------------------
                 # ① 現在タスクのバッチを gpu に載せる
                 # ----------------------------------------
-                inputs = inputs.to(self._device)
+                inputs1 = inputs1.to(self._device)
+                inputs2 = inputs2.to(self._device)
                 targets = targets.to(self._device)
+                inputs = torch.cat([inputs1, inputs2], dim=0)
+                targets = torch.cat([targets, targets], dim=0)
 
                 # ----------------------------------------
                 # ② 損失計算
                 # ----------------------------------------
-                logits, loss_clf, loss_fe, loss_kd, loss_forg = self.compute_loss(inputs, targets)
-                loss = loss_clf * self.lambda_clf + loss_fe * self.lambda_fe + loss_kd +loss_forg * self.lambda_forg
+                logits, loss_clf, infonce_loss, loss_fe, loss_kd, loss_forg = self.compute_loss(inputs, targets)
+                loss = loss_clf * self.lambda_clf + infonce_loss * self.args['contrast_factor'] + loss_fe * self.lambda_fe + loss_kd +loss_forg * self.lambda_forg
 
                 # ----------------------------------------
                 # ③ 最適化処理
@@ -424,6 +444,7 @@ class FOSTERMU(BaseLearner):
                 losses_fe += loss_fe.item()
                 losses_kd += loss_kd.item()
                 losses_forg += loss_forg.item()
+                losses_ince += infonce_loss.item()
 
                 # ----------------------------------------
                 # ⑤ 訓練精度の計算
@@ -436,11 +457,12 @@ class FOSTERMU(BaseLearner):
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             if epoch % 5 == 0:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_fe {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_ince {:.3f}, Loss_fe {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1, self.epochs,
                     losses / len(train_loader),
                     losses_clf / len(train_loader),
+                    losses_ince / len(train_loader),
                     losses_fe / len(train_loader),
                     losses_kd / len(train_loader),
                     losses_forg / len(train_loader),
@@ -448,12 +470,13 @@ class FOSTERMU(BaseLearner):
                     test_acc,
                 )
             else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_fe {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}".format(
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_ince {:.3f}, Loss_fe {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     self.epochs,
                     losses / len(train_loader),
                     losses_clf / len(train_loader),
+                    losses_ince / len(train_loader),
                     losses_fe / len(train_loader),
                     losses_kd / len(train_loader),
                     losses_forg / len(train_loader),
@@ -466,7 +489,7 @@ class FOSTERMU(BaseLearner):
     def _feature_compression(self, train_loader, test_loader):
 
         #=== 初期化モデルを用意 ===#
-        self._snet = FOSTERNet(self.args, False)
+        self._snet = INCE_FOSTERNet(self.args, False)
         self._snet.update_fc(self._total_classes)
 
         #=== データパラレルの用意 ===#
@@ -515,13 +538,16 @@ class FOSTERMU(BaseLearner):
             correct, total = 0, 0
 
             #=== 1エポックの学習 ===#
-            for i, (_, inputs, targets) in enumerate(train_loader):
+            for i, (_, inputs1, inputs2, targets) in enumerate(train_loader):
 
                 # ----------------------------------------
                 # ① 現在タスクのバッチを gpu に載せる
                 # ----------------------------------------
-                inputs = inputs.to(self._device)
+                inputs1 = inputs1.to(self._device)
+                inputs2 = inputs2.to(self._device)
                 targets = targets.to(self._device)
+                inputs = torch.cat([inputs1, inputs2], dim=0)
+                targets = torch.cat([targets, targets], dim=0)
 
                 # ----------------------------------------
                 # ② 損失計算
@@ -617,6 +643,7 @@ class FOSTERMU(BaseLearner):
             outputs["fe_logits"],
             outputs["old_logits"].detach(),
         )
+        embedding = outputs['embedding']
 
         #=== forget / retain クラスを分割するためのマスク作成 ===#
         # バッチサイズ
@@ -651,6 +678,57 @@ class FOSTERMU(BaseLearner):
 
             loss_clf = F.cross_entropy(retain_logits / self.per_cls_weights, retain_targets)
 
+        #=== InfoNCE損失を計算 ===#
+        infonce_loss = torch.tensor(0., device=self._device)
+        
+        # 維持クラスがあれば損失計算
+        if mask_retain.any():
+
+            r_embedding = embedding[mask_retain]
+
+            if r_embedding.shape[0] >= 2 and (r_embedding.shape[0] % 2 == 0):
+                infonce_loss = infoNCE_loss(r_embedding, self.args["infonce_temp"])
+
+        #=== InfoNCE蒸留（TagFexと同型）を追加 ===#
+        infonce_kd_loss = torch.tensor(0., device=self._device)
+
+        # teacher がある & 2タスク目以降 & retain があるときだけ
+        if (self._cur_task > 0) and mask_retain.any() and hasattr(self, "_old_network") and (self._old_network is not None):
+
+            # teacher は eval + no_grad で embedding を取る
+            with torch.no_grad():
+                old_net = self._old_network
+                # DataParallel 対応（もし使ってる場合）
+                if hasattr(old_net, "module"):
+                    old_net = old_net.module
+                old_out = old_net(inputs)
+                old_embedding = old_out["embedding"]
+
+            # distill は「old class（< known_classes）」だけに掛ける（TagFexに寄せる）
+            mask_old = mask_retain & (targets < self._known_classes)
+
+            if mask_old.any():
+                r_embedding_old = embedding[mask_old]
+                r_old_embedding_old = old_embedding[mask_old]
+
+                # InfoNCEは2-view前提なので偶数チェック
+                if (
+                    (r_embedding_old.shape[0] >= 2)
+                    and (r_embedding_old.shape[0] % 2 == 0)
+                    and (r_old_embedding_old.shape[0] == r_embedding_old.shape[0])
+                ):
+                    kd_temp = self.args.get("infonce_kd_temp", self.args["infonce_temp"])
+                    infonce_kd_loss = infoNCE_distill_loss(
+                        r_embedding_old, r_old_embedding_old, kd_temp
+                    )
+
+                    # TagFex流：auto_kd_factor で mix（distillが計算できた時だけ）
+                    auto_kd_factor = float(self._known_classes) / float(self._total_classes)
+                    kd_factor = float(self.args.get("contrast_kd_factor", 1.0))
+
+                    # 既存の infonce_loss（retain全体）を base として混ぜる
+                    infonce_loss = (1.0 - auto_kd_factor) * infonce_loss + auto_kd_factor * (kd_factor * infonce_kd_loss)
+                    
         #=== FE 損失を計算 ===#
         loss_fe = torch.tensor(0., device=self._device)
 
@@ -686,7 +764,7 @@ class FOSTERMU(BaseLearner):
             uniform = torch.full_like(log_p, 1.0 / num_classes)
             loss_forg = F.kl_div(log_p, uniform, reduction="batchmean")
 
-        return logits, loss_clf, loss_fe, loss_kd, loss_forg
+        return logits, loss_clf, infonce_loss, loss_fe, loss_kd, loss_forg
 
     def BKD(self, pred, soft, T):
         pred = torch.log_softmax(pred / T, dim=1)
@@ -1188,3 +1266,31 @@ def _KD_loss(pred, soft, T):
 
 
 
+def infoNCE_loss(feats, t):
+    cos_sim = F.cosine_similarity(feats[:,None,:], feats[None,:,:], dim=-1)
+    # Mask out cosine similarity to itself
+    self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
+    cos_sim.masked_fill_(self_mask, -9e15)
+    # Find positive example -> batch_size//2 away from the original example
+    pos_mask = self_mask.roll(shifts=cos_sim.shape[0]//2, dims=0)
+    # InfoNCE loss
+    cos_sim = cos_sim / t
+    nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
+    nll = nll.mean()
+
+    return nll
+
+def infoNCE_distill_loss(p_feats, z_feats, t):
+    # print(p_feats.shape, z_feats.shape)
+    cos_sim = F.cosine_similarity(p_feats[:,None,:], z_feats[None,:,:], dim=-1)
+    # Mask out cosine similarity to itself
+    self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
+    cos_sim.masked_fill_(self_mask, -9e15)
+    # Find positive example -> batch_size//2 away from the original example
+    pos_mask = self_mask.roll(shifts=cos_sim.shape[0]//2, dims=0)
+    # InfoNCE loss
+    cos_sim = cos_sim / t
+    nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
+    nll = nll.mean()
+
+    return nll

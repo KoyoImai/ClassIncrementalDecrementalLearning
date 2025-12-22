@@ -1,7 +1,7 @@
 {
     "log": "baseline0",
     "prefix": "cidl1",
-    "dataset": "cifar100",
+    "dataset": "cifar100_aa",
     "memory_size": 2000,
     "memory_per_class": 20,
     "fixed_memory": false,
@@ -42,5 +42,10 @@
     "T" : 2,
     "device": ["2"],
     "seed": [1993],
-    "beta1":0.96
+    "beta1":0.96,
+    "phase_id": 9,
+    "proto_n": 5,
+    "proto_metric": "sqeuclidean",
+    "proto_l2norm": true,
+    "proto_batch_size": 128
 }

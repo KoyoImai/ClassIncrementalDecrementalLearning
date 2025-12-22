@@ -1,3 +1,4 @@
+# Please note that the current implementation of DER only contains the dynamic expansion process, since masking and pruning are not implemented by the source repo.
 import copy
 import logging
 import numpy as np
@@ -9,20 +10,33 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from scipy.spatial.distance import cdist
 from models.base import BaseLearner
-from utils.inc_net import FOSTERNet
+from utils.inc_net import INCEDERNet, IncrementalNet
 from utils.toolkit import count_parameters, target2onehot, tensor2numpy
-
-# Please refer to https://github.com/G-U-N/ECCV22-FOSTER for the full source code to reproduce foster.
 
 EPSILON = 1e-8
 
+# init_epoch = 200
+# init_lr = 0.1
+# init_milestones = [60, 120, 170]
+# init_lr_decay = 0.1
+# init_weight_decay = 0.0005
 
-class FOSTERMU(BaseLearner):
+
+# epochs = 170
+# lrate = 0.1
+# milestones = [80, 120, 150]
+# lrate_decay = 0.1
+# batch_size = 128
+# weight_decay = 2e-4
+# num_workers = 8
+# T = 2
+
+
+class DERINCE(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
-
-        self._network = FOSTERNet(args, False)
+        self._network = INCEDERNet(args, False)
 
         # Machine Unleaning パラメータ
         self.forget_list = args["forget_cls"]   # タスク毎の忘却予定リスト
@@ -30,10 +44,28 @@ class FOSTERMU(BaseLearner):
 
         self._retain_classes = 0
 
+        # 学習ハイパラ（全タスク共通）
+        self.batch_size = args["batch_size"]
+        
+        #　学習ハイパラ（初期タスク）
+        self.init_epoch = args["init_epoch"]
+        self.init_lr = args["init_lr"]
+        self.init_milestones = args["init_milestones"]
+        self.init_lr_decay = args["init_lr_decay"]
+        self.init_weight_decay = args["init_weight_decay"]
+
+        # 学習ハイパラ（後続タスク）
+        self.epochs = args["epochs"]
+        self.lr = args["lr"]
+        self.milestones = args["milestones"]
+        self.lr_decay = args["lr_decay"]
+        self.weight_decay = args["weight_decay"]
+        self.lambda_forg = args["lambda_forg"]
+        self.T = args["T"]
+
         # 学習ハイパラ（損失重み）
         self.lambda_clf = args["lambda_clf"]
-        self.lambda_fe = args["lambda_fe"]
-        self.lambda_kd = args["lambda_kd"]
+        self.lambda_aux = args["lambda_aux"]
         self.lambda_forg = args["lambda_forg"]
 
         # 忘却クラスのNME分類用
@@ -42,25 +74,6 @@ class FOSTERMU(BaseLearner):
 
         # その他パラメータ
         self.num_workers = args["num_workers"]
-
-        
-        self.batch_size = args["batch_size"]
-        self.init_lr = args["init_lr"]
-        self.init_epochs = args["init_epochs"]
-        self.init_weight_decay = args["init_weight_decay"]
-
-        self.lr = args["lr"]
-        self.epochs = args["boosting_epochs"]
-        
-        self._snet = None
-        self.beta1 = args["beta1"]
-        self.beta2 = args["beta2"]
-        self.per_cls_weights = None
-        self.is_teacher_wa = args["is_teacher_wa"]
-        self.is_student_wa = args["is_student_wa"]
-        self.lambda_okd = args["lambda_okd"]
-        self.wa_value = args["wa_value"]
-        self.oofc = args["oofc"].lower()
 
     #---------------------------------------------------------------------------------------
     # タスク後の処理
@@ -102,11 +115,6 @@ class FOSTERMU(BaseLearner):
 
         #=== 現在タスクの更新 ===#
         self._cur_task += 1
-        if self._cur_task > 1:
-            self._network = self._snet
-        self._total_classes = self._known_classes + data_manager.get_task_size(
-            self._cur_task
-        )
 
         #=== 現在タスクのクラスまでを含めた合計のクラス数を更新 ===#
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
@@ -117,17 +125,13 @@ class FOSTERMU(BaseLearner):
 
         #=== モデルの出力層を更新 ===#
         self._network.update_fc(self._total_classes)
-        self._network_module_ptr = self._network
-        logging.info(
-            "Learning on {}-{}".format(self._known_classes, self._total_classes)
-        )
+        logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
 
         #=== 並列モデルはパラメータを固定 ===#
         if self._cur_task > 0:
-            for p in self._network.convnets[0].parameters():
-                p.requires_grad = False
-            for p in self._network.oldfc.parameters():
-                p.requires_grad = False
+            for i in range(self._cur_task):
+                for p in self._network.convnets[i].parameters():
+                    p.requires_grad = False
 
         logging.info("All params: {}".format(count_parameters(self._network)))
         logging.info(
@@ -147,8 +151,7 @@ class FOSTERMU(BaseLearner):
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
+            num_workers=self.num_workers
         )
 
         #=== テスト用データセットの作成 ===#
@@ -169,7 +172,7 @@ class FOSTERMU(BaseLearner):
         # データパラレルの設定
         if len(self._multiple_gpus) > 1:
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
-
+        
         # 訓練を実行
         self._train(self.train_loader, self.test_loader)
 
@@ -177,28 +180,29 @@ class FOSTERMU(BaseLearner):
         self._retain_classes = self._total_classes - len(self.forget_classes)
 
         # リプレイバッファの更新
-        if self._fixed_memory:
-            m = self._memory_per_class  # または self.samples_old_class
-        else:
-            m = self._memory_size // self._retain_classes
+        m = self._memory_size // self._retain_classes
         self.build_rehearsal_memory(data_manager, m)
         print("self._targets_memory.shape: ", self._targets_memory.shape)
-
+        
+        
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
     def train(self):
-        self._network_module_ptr.train()
+        self._network.train()
+        if len(self._multiple_gpus) > 1 :
+            self._network_module_ptr = self._network.module
+        else:
+            self._network_module_ptr = self._network
         self._network_module_ptr.convnets[-1].train()
         if self._cur_task >= 1:
-            self._network_module_ptr.convnets[0].eval()
-
+            for i in range(self._cur_task):
+                self._network_module_ptr.convnets[i].eval()
+    
     def _train(self, train_loader, test_loader):
 
         #=== model をデバイスに配置 ===#
         self._network.to(self._device)
-        if hasattr(self._network, "module"):
-            self._network_module_ptr = self._network.module
 
         #=== 1タスク目の学習 ===#
         if self._cur_task == 0:
@@ -207,14 +211,15 @@ class FOSTERMU(BaseLearner):
             optimizer = optim.SGD(
                 filter(lambda p: p.requires_grad, self._network.parameters()),
                 momentum=0.9,
-                lr=self.init_lr,
+                lr=self.lr,
                 weight_decay=self.init_weight_decay,
             )
 
             #=== Scheduler の設定 ===#
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            scheduler = optim.lr_scheduler.MultiStepLR(
                 optimizer=optimizer,
-                T_max=self.args["init_epochs"]
+                milestones=self.init_milestones,
+                gamma=self.init_lr_decay
             )
 
             #=== 学習の実行 ===#
@@ -227,74 +232,37 @@ class FOSTERMU(BaseLearner):
 
         #=== 2タスク目以降の学習 ===#
         else:
-            
-            #=== 各クラスのサンプル数に応じて重みを作成 ===#
-            cls_num_list = [self.samples_old_class] * self._known_classes + [
-                self.samples_new_class(i)
-                for i in range(self._known_classes, self._total_classes)
-            ]
-
-            effective_num = 1.0 - np.power(self.beta1, cls_num_list)
-            per_cls_weights = (1.0 - self.beta1) / np.array(effective_num)
-            per_cls_weights = (
-                per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
-            )
-
-            logging.info("per cls weights : {}".format(per_cls_weights))
-            self.per_cls_weights = torch.FloatTensor(per_cls_weights).to(self._device)
 
             #=== Optimizer の設定 ===#
             optimizer = optim.SGD(
                 filter(lambda p: p.requires_grad, self._network.parameters()),
-                lr=self.args["lr"],
+                lr=self.lr,
                 momentum=0.9,
-                weight_decay=self.args["weight_decay"],
+                weight_decay=self.weight_decay,
             )
 
             #=== Scheduler の設定 ===#
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            scheduler = optim.lr_scheduler.MultiStepLR(
                 optimizer=optimizer,
-                T_max=self.args["boosting_epochs"]
+                milestones=self.milestones,
+                gamma=self.lr_decay
             )
-
-            #=== マスクの作成 ===#
-            if self.oofc == "az":
-                for i, p in enumerate(self._network_module_ptr.fc.parameters()):
-                    if i == 0:
-                        p.data[
-                            self._known_classes :, : self._network_module_ptr.out_dim
-                        ] = torch.tensor(0.0)
-            elif self.oofc != "ft":
-                assert 0, "not implemented"
 
             # 学習の実行
-            self._feature_boosting(train_loader, test_loader, optimizer, scheduler)
-            if self.is_teacher_wa:
-                self._network_module_ptr.weight_align(
-                    self._known_classes,
-                    self._total_classes - self._known_classes,
-                    self.wa_value,
+            self._update_representation(train_loader, test_loader, optimizer, scheduler)
+            
+            # 
+            if len(self._multiple_gpus) > 1:
+                self._network.module.weight_align(
+                    self._total_classes - self._known_classes
                 )
             else:
-                logging.info("do not weight align teacher!")
-            
-            cls_num_list = [self.samples_old_class] * self._known_classes + [
-                self.samples_new_class(i)
-                for i in range(self._known_classes, self._total_classes)
-            ]
-            effective_num = 1.0 - np.power(self.beta2, cls_num_list)
-            per_cls_weights = (1.0 - self.beta2) / np.array(effective_num)
-            per_cls_weights = (
-                per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
-            )
-            logging.info("per cls weights : {}".format(per_cls_weights))
-            self.per_cls_weights = torch.FloatTensor(per_cls_weights).to(self._device)
-            self._feature_compression(train_loader, test_loader)
+                self._network.weight_align(self._total_classes - self._known_classes)
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
-
+        
         #=== プログレスバーの設定 ===#
-        prog_bar = tqdm(range(self.init_epochs))
+        prog_bar = tqdm(range(self.init_epoch))
 
         #=== 1エポックずつ学習 ===#
         for _, epoch in enumerate(prog_bar):
@@ -308,23 +276,31 @@ class FOSTERMU(BaseLearner):
             total = 0
 
             #=== 1エポックの学習 ===#
-            for i, (_, inputs, targets) in enumerate(train_loader):
+            for i, (_, inputs1, inputs2, targets) in enumerate(train_loader):
                 
                 # ----------------------------------------
                 # ① 現在タスクのバッチを gpu に載せる
                 # ----------------------------------------
-                inputs = inputs.to(self._device)
+                inputs1 = inputs1.to(self._device)
+                inputs2 = inputs2.to(self._device)
                 targets = targets.to(self._device)
+                inputs = torch.cat([inputs1, inputs2], dim=0)
+                targets = torch.cat([targets, targets], dim=0)
 
                 # ----------------------------------------
                 # ② Forward 処理
                 # ----------------------------------------
-                logits = self._network(inputs)["logits"]
+                out = self._network(inputs)
+                logits = out["logits"]
+                embedding = out["embedding"]
 
                 # ----------------------------------------
                 # ③ 損失計算
                 # ----------------------------------------
-                loss = F.cross_entropy(logits, targets)
+                loss_clf = F.cross_entropy(logits, targets)
+                infonce_loss = infoNCE_loss(embedding, self.args['infonce_temp'])
+
+                loss = loss_clf + infonce_loss * self.args['contrast_factor']
 
                 # ----------------------------------------
                 # ④ 最適化処理
@@ -349,7 +325,7 @@ class FOSTERMU(BaseLearner):
                 info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
-                    self.init_epochs,
+                    self.init_epoch,
                     losses / len(train_loader),
                     train_acc,
                     test_acc,
@@ -358,7 +334,7 @@ class FOSTERMU(BaseLearner):
                 info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
-                    self.init_epochs,
+                    self.init_epoch,
                     losses / len(train_loader),
                     train_acc,
                 )
@@ -368,10 +344,12 @@ class FOSTERMU(BaseLearner):
 
         logging.info(info)
 
-    def _feature_boosting(self, train_loader, test_loader, optimizer, scheduler):
-        
+
+    #=== 2タスク目以降の学習 ===#
+    def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
+
         #=== プログレスバーの設定 ===#
-        prog_bar = tqdm(range(self.args["boosting_epochs"]))
+        prog_bar = tqdm(range(self.epochs))
 
         #=== 1エポックずつ学習 ===#
         for _, epoch in enumerate(prog_bar):
@@ -379,12 +357,11 @@ class FOSTERMU(BaseLearner):
             #=== model を trainモード に変更
             self.train()
 
-            losses = 0.0
-            losses_clf = 0.0
-            losses_fe = 0.0
-            losses_kd = 0.0
-            losses_forg = 0.0
-
+            #=== 記録用変数の初期化 ===#
+            losses = 0.
+            losses_clf = 0.
+            losses_aux = 0.
+            losses_forg = 0.
             correct = 0.
             total = 0.
 
@@ -400,29 +377,19 @@ class FOSTERMU(BaseLearner):
                 # ----------------------------------------
                 # ② 損失計算
                 # ----------------------------------------
-                logits, loss_clf, loss_fe, loss_kd, loss_forg = self.compute_loss(inputs, targets)
-                loss = loss_clf * self.lambda_clf + loss_fe * self.lambda_fe + loss_kd +loss_forg * self.lambda_forg
+                logits, loss_clf, loss_aux, loss_forg = self.compute_loss(inputs, targets)
+                loss = loss_clf * self.lambda_clf + loss_aux * self.lambda_aux +loss_forg * self.lambda_forg
 
                 # ----------------------------------------
                 # ③ 最適化処理
                 # ----------------------------------------
                 optimizer.zero_grad()
                 loss.backward()
-                if self.oofc == "az":
-                    for i, p in enumerate(self._network_module_ptr.fc.parameters()):
-                        if i == 0:
-                            p.grad.data[
-                                self._known_classes :,
-                                : self._network_module_ptr.out_dim,
-                            ] = torch.tensor(0.0)
-                elif self.oofc != "ft":
-                    assert 0, "not implemented"
                 optimizer.step()
 
                 losses += loss.item()
                 losses_clf += loss_clf.item()
-                losses_fe += loss_fe.item()
-                losses_kd += loss_kd.item()
+                losses_aux += loss_aux.item()
                 losses_forg += loss_forg.item()
 
                 # ----------------------------------------
@@ -436,26 +403,24 @@ class FOSTERMU(BaseLearner):
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             if epoch % 5 == 0:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_fe {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_aux {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1, self.epochs,
                     losses / len(train_loader),
                     losses_clf / len(train_loader),
-                    losses_fe / len(train_loader),
-                    losses_kd / len(train_loader),
+                    losses_aux / len(train_loader),
                     losses_forg / len(train_loader),
                     train_acc,
                     test_acc,
                 )
             else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_fe {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}".format(
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Loss_clf {:.3f}, Loss_aux {:.3f}, Loss_forg {:.3f}, Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     self.epochs,
                     losses / len(train_loader),
                     losses_clf / len(train_loader),
-                    losses_fe / len(train_loader),
-                    losses_kd / len(train_loader),
+                    losses_aux / len(train_loader),
                     losses_forg / len(train_loader),
                     train_acc,
                 )
@@ -463,160 +428,14 @@ class FOSTERMU(BaseLearner):
             logging.info(info)
         logging.info(info)
 
-    def _feature_compression(self, train_loader, test_loader):
-
-        #=== 初期化モデルを用意 ===#
-        self._snet = FOSTERNet(self.args, False)
-        self._snet.update_fc(self._total_classes)
-
-        #=== データパラレルの用意 ===#
-        if len(self._multiple_gpus) > 1:
-            self._snet = nn.DataParallel(self._snet, self._multiple_gpus)
-        if hasattr(self._snet, "module"):
-            self._snet_module_ptr = self._snet.module
-        else:
-            self._snet_module_ptr = self._snet
-
-        #=== モデルをデバイス上に配置 ===#
-        self._snet.to(self._device)
-
-        self._snet_module_ptr.convnets[0].load_state_dict(
-            self._network_module_ptr.convnets[0].state_dict()
-        )
-        self._snet_module_ptr.copy_fc(self._network_module_ptr.oldfc)
-
-        #=== Optimizer の作成 ===#
-        optimizer = optim.SGD(
-            filter(lambda p: p.requires_grad, self._snet.parameters()),
-            lr=self.args["lr"],
-            momentum=0.9,
-        )
-
-        #=== Scheduler の作成 ===#
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer=optimizer,
-            T_max=self.args["compression_epochs"]
-        )
-
-        #=== 教師モデルを評価モードに変更 ===#
-        self._network.eval()
-
-        #=== プログレスバーの設定 ===#
-        prog_bar = tqdm(range(self.args["compression_epochs"]))
-
-        #=== 1エポックずつ学習 ===#
-        for _, epoch in enumerate(prog_bar):
-
-            #=== 生徒モデルを訓練モードに変更 ===#
-            self._snet.train()
-
-            #=== 記録用変数の初期化 ===#
-            losses = 0.0
-            correct, total = 0, 0
-
-            #=== 1エポックの学習 ===#
-            for i, (_, inputs, targets) in enumerate(train_loader):
-
-                # ----------------------------------------
-                # ① 現在タスクのバッチを gpu に載せる
-                # ----------------------------------------
-                inputs = inputs.to(self._device)
-                targets = targets.to(self._device)
-
-                # ----------------------------------------
-                # ② 損失計算
-                # ----------------------------------------
-                dark_logits = self._snet(inputs)["logits"]
-                with torch.no_grad():
-                    outputs = self._network(inputs)
-                    logits, old_logits, fe_logits = (
-                        outputs["logits"],
-                        outputs["old_logits"],
-                        outputs["fe_logits"],
-                    )
-                loss_dark = self.BKD(dark_logits, logits, self.args["T"])
-                loss = loss_dark
-
-                # ----------------------------------------
-                # ③ 最適化処理
-                # ----------------------------------------
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                losses += loss.item()
-
-                # ----------------------------------------
-                # ⑤ 訓練精度の計算
-                # ----------------------------------------
-                _, preds = torch.max(dark_logits[: targets.shape[0]], dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-
-            scheduler.step()
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            if epoch % 5 == 0:
-                test_acc = self._compute_accuracy(self._snet, test_loader)
-                info = "SNet: Task {}, Epoch {}/{} => Loss {:.3f},  Train_accy {:.2f}, Test_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["compression_epochs"],
-                    losses / len(train_loader),
-                    train_acc,
-                    test_acc,
-                )
-            else:
-                info = "SNet: Task {}, Epoch {}/{} => Loss {:.3f},  Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["compression_epochs"],
-                    losses / len(train_loader),
-                    train_acc,
-                )
-            prog_bar.set_description(info)
-            logging.info(info)
-        if len(self._multiple_gpus) > 1:
-            self._snet = self._snet.module
-        if self.is_student_wa:
-            self._snet.weight_align(
-                self._known_classes,
-                self._total_classes - self._known_classes,
-                self.wa_value,
-            )
-        else:
-            logging.info("do not weight align student!")
-
-
-        self._snet.eval()
-        y_pred, y_true = [], []
-        for _, (_, inputs, targets) in enumerate(test_loader):
-            inputs = inputs.to(self._device, non_blocking=True)
-            with torch.no_grad():
-                outputs = self._snet(inputs)["logits"]
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[1]
-            y_pred.append(predicts.cpu().numpy())
-            y_true.append(targets.cpu().numpy())
-        y_pred = np.concatenate(y_pred)
-        y_true = np.concatenate(y_true)
-        cnn_accy = self._evaluate(y_pred, y_true)
-        logging.info("darknet eval: ")
-        logging.info("CNN top1 curve: {}".format(cnn_accy["top1"]))
-        logging.info("CNN top5 curve: {}".format(cnn_accy["top5"]))
-
 
     def compute_loss(self, inputs, targets):
 
         #=== model にサンプルを入力して outputs を取得 ===#
         outputs = self._network(inputs)
 
-        #=== logits を分解 ===#
-        logits, fe_logits, old_logits = (
-            outputs["logits"],
-            outputs["fe_logits"],
-            outputs["old_logits"].detach(),
-        )
+        logits = outputs["logits"]
+        aux_logits = outputs["aux_logits"]
 
         #=== forget / retain クラスを分割するためのマスク作成 ===#
         # バッチサイズ
@@ -649,66 +468,42 @@ class FOSTERMU(BaseLearner):
             retain_logits = logits[mask_retain]
             retain_targets = targets[mask_retain]
 
-            loss_clf = F.cross_entropy(retain_logits / self.per_cls_weights, retain_targets)
+            loss_clf = F.cross_entropy(retain_logits, retain_targets)
 
-        #=== FE 損失を計算 ===#
-        loss_fe = torch.tensor(0., device=self._device)
 
-        # 維持クラスがあれば損失計算
-        if mask_retain.any():
-
-            # retain クラスの logits と targets を取り出す
-            retain_fe_logits = fe_logits[mask_retain]
-            retain_targets = targets[mask_retain]
-
-            loss_fe = F.cross_entropy(retain_fe_logits, retain_targets)
-
-        #=== 蒸留損失を計算 ===#
-        loss_kd = torch.tensor(0., device=self._device)
+        #=== aux 損失を計算 ===#
+        loss_aux = torch.tensor(0., device=self._device)
 
         # 維持クラスがあれば損失計算
         if mask_retain.any():
+            retain_aux_logits = aux_logits[mask_retain]
 
-            retain_logits_old = retain_logits[:, : self._known_classes]     # [Br, known]
-            retain_old_logits = old_logits[mask_retain]                    # [Br, known]
-            loss_kd = self.lambda_okd * _KD_loss(
-                retain_logits_old, retain_old_logits, self.args["T"]
+            aux_targets = retain_targets.clone()
+            aux_targets = torch.where(
+                aux_targets - self._known_classes + 1 > 0,
+                aux_targets - self._known_classes + 1,
+                0,
             )
-
-
-        #=== 忘却損失を計算 ===#
+            loss_aux = F.cross_entropy(retain_aux_logits, aux_targets)
+        
+        #=== 忘却損失の計算 ===#
         loss_forg = torch.tensor(0., device=self._device)
 
+        # forget クラスの logits と targets を取り出す
+        forget_logits = logits[mask_forget]
+        forget_targets = targets[mask_forget]
+
         if mask_forget.any():
-            forget_logits = logits[mask_forget]            # [Bf, C]
+            forget_logits = logits[mask_forget]              # [Bf, C]
             log_p = F.log_softmax(forget_logits, dim=1)
             num_classes = log_p.size(1)
-            uniform = torch.full_like(log_p, 1.0 / num_classes)
+            uniform = torch.full_like(log_p, 1.0 / num_classes)  # target is prob (not log)
+
             loss_forg = F.kl_div(log_p, uniform, reduction="batchmean")
 
-        return logits, loss_clf, loss_fe, loss_kd, loss_forg
 
-    def BKD(self, pred, soft, T):
-        pred = torch.log_softmax(pred / T, dim=1)
-        soft = torch.softmax(soft / T, dim=1)
-        soft = soft * self.per_cls_weights
-        soft = soft / soft.sum(1)[:, None]
-        return -1 * torch.mul(soft, pred).sum() / pred.shape[0]
+        return logits ,loss_clf, loss_aux, loss_forg
     
-
-    @property
-    def samples_old_class(self):
-        if self._fixed_memory:
-            return self._memory_per_class
-        else:
-            assert self._total_classes != 0, "Total classes is 0"
-            return self._memory_size // self._known_classes
-
-    def samples_new_class(self, index):
-        if self.args["dataset"] == "cifar100":
-            return 500
-        else:
-            return self.data_manager.getlen(index)
 
     #---------------------------------------------------------------------------------------
     # リプレイバッファの構築
@@ -717,145 +512,12 @@ class FOSTERMU(BaseLearner):
         
         #=== クラス毎に固定数 per_class を保存する場合 ===#
         if self._fixed_memory:
+            assert False
             self._construct_exemplar_unified(data_manager, per_class)
         #=== リプレイバッファのサイズを固定し，self_retain_classes の数で均等に分割する場合 ===#
         else:
             self._reduce_exemplar(data_manager, per_class)
             self._construct_exemplar(data_manager, per_class)
-
-    def _construct_exemplar_unified(self, data_manager, m):
-        logging.info(
-            "Constructing exemplars for new classes...({} per classes)".format(m)
-        )
-
-        # --- forget class set ---
-        forget_seen = {c for c in getattr(self, "forget_classes", [])
-                    if 0 <= c < self._total_classes}
-
-        # --- helper: mean calc from (dd, dt) ---
-        def _calc_mean_from_appendent(dd, dt):
-            idx_dataset = data_manager.get_dataset(
-                [], source="train", mode="test", appendent=(dd, dt)
-            )
-            idx_loader = DataLoader(
-                idx_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4
-            )
-            vectors, _ = self._extract_vectors(idx_loader)
-            vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
-            mean = np.mean(vectors, axis=0)
-            n = np.linalg.norm(mean)
-            if n > 0:
-                mean = mean / n
-            return mean
-
-        # =========================================================
-        # (A) まずメモリ内の forget exemplars を退避→削除
-        # =========================================================
-        if len(forget_seen) > 0 and len(getattr(self, "_targets_memory", [])) > 0:
-            for c in sorted(forget_seen):
-                idx = np.where(self._targets_memory == c)[0]
-                if len(idx) == 0:
-                    continue
-
-                # 忘却クラスの mean を「削除前」に計算して保存（方針1）
-                if c not in self._forget_class_means:
-                    dd = self._data_memory[idx]
-                    dt = self._targets_memory[idx]
-                    self._forget_class_means[c] = _calc_mean_from_appendent(dd, dt)
-                    if c not in self._forget_class_targets:
-                        self._forget_class_targets.append(c)
-
-            # forget exemplars をメモリから削除
-            keep_mask = ~np.isin(self._targets_memory, list(forget_seen))
-            self._data_memory = self._data_memory[keep_mask]
-            self._targets_memory = self._targets_memory[keep_mask]
-
-        # class means（retain 側だけ更新。forget は _forget_class_means で管理）
-        _class_means = np.zeros((self._total_classes, self.feature_dim))
-
-        # =========================================================
-        # (B) old classes の mean を「残った exemplars」で更新（forget はスキップ）
-        # =========================================================
-        for class_idx in range(self._known_classes):
-
-            if class_idx in forget_seen:
-                continue  # ★ forget class はメモリにいない前提
-
-            mask = np.where(self._targets_memory == class_idx)[0]
-            if len(mask) == 0:
-                continue
-
-            class_data, class_targets = self._data_memory[mask], self._targets_memory[mask]
-            mean = _calc_mean_from_appendent(class_data, class_targets)
-            _class_means[class_idx, :] = mean
-
-        # =========================================================
-        # (C) new classes: exemplar 構築（forget は作らない）
-        # =========================================================
-        for class_idx in range(self._known_classes, self._total_classes):
-
-            # 忘却対象の新クラスなら、exemplar は作らず mean だけ保存してスキップ
-            if class_idx in forget_seen:
-                if class_idx not in self._forget_class_means:
-                    data, targets, class_dset = data_manager.get_dataset(
-                        np.arange(class_idx, class_idx + 1),
-                        source="train",
-                        mode="test",
-                        ret_data=True,
-                    )
-                    mean = _calc_mean_from_appendent(data, targets)
-                    self._forget_class_means[class_idx] = mean
-                    if class_idx not in self._forget_class_targets:
-                        self._forget_class_targets.append(class_idx)
-                continue
-
-            data, targets, class_dset = data_manager.get_dataset(
-                np.arange(class_idx, class_idx + 1),
-                source="train",
-                mode="test",
-                ret_data=True,
-            )
-            class_loader = DataLoader(
-                class_dset, batch_size=self.batch_size, shuffle=False, num_workers=4
-            )
-
-            vectors, _ = self._extract_vectors(class_loader)
-            vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
-            class_mean = np.mean(vectors, axis=0)
-
-            # Select (herding)
-            selected_exemplars = []
-            exemplar_vectors = []
-            for k in range(1, m + 1):
-                S = np.sum(exemplar_vectors, axis=0) if len(exemplar_vectors) > 0 else 0
-                mu_p = (vectors + S) / k
-                i = np.argmin(np.sqrt(np.sum((class_mean - mu_p) ** 2, axis=1)))
-
-                selected_exemplars.append(np.array(data[i]))
-                exemplar_vectors.append(np.array(vectors[i]))
-
-                vectors = np.delete(vectors, i, axis=0)
-                data = np.delete(data, i, axis=0)
-
-            selected_exemplars = np.array(selected_exemplars)
-            exemplar_targets = np.full(m, class_idx)
-
-            self._data_memory = (
-                np.concatenate((self._data_memory, selected_exemplars))
-                if len(self._data_memory) != 0
-                else selected_exemplars
-            )
-            self._targets_memory = (
-                np.concatenate((self._targets_memory, exemplar_targets))
-                if len(self._targets_memory) != 0
-                else exemplar_targets
-            )
-
-            # Exemplar mean
-            mean = _calc_mean_from_appendent(selected_exemplars, exemplar_targets)
-            _class_means[class_idx, :] = mean
-
-        self._class_means = _class_means
 
     def _reduce_exemplar(self, data_manager, m):
         logging.info("Reducing exemplars...({} per classes)".format(m))
@@ -1016,10 +678,6 @@ class FOSTERMU(BaseLearner):
             self._class_means[class_idx, :] = mean
 
 
-
-    #---------------------------------------------------------------------------------------
-    # 評価関連の処理
-    #---------------------------------------------------------------------------------------
     #---------------------------------------------------------------------------------------
     # 評価関連の処理
     #---------------------------------------------------------------------------------------
@@ -1181,10 +839,42 @@ class FOSTERMU(BaseLearner):
         return cnn_accy, nme_accy
 
 
-def _KD_loss(pred, soft, T):
-    pred = torch.log_softmax(pred / T, dim=1)
-    soft = torch.softmax(soft / T, dim=1)
-    return -1 * torch.mul(soft, pred).sum() / pred.shape[0]
+
+
+
+def infoNCE_loss(feats, t):
+    cos_sim = F.cosine_similarity(feats[:,None,:], feats[None,:,:], dim=-1)
+    # Mask out cosine similarity to itself
+    self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
+    cos_sim.masked_fill_(self_mask, -9e15)
+    # Find positive example -> batch_size//2 away from the original example
+    pos_mask = self_mask.roll(shifts=cos_sim.shape[0]//2, dims=0)
+    # InfoNCE loss
+    cos_sim = cos_sim / t
+    nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
+    nll = nll.mean()
+
+    return nll
+
+def infoNCE_distill_loss(p_feats, z_feats, t):
+    # print(p_feats.shape, z_feats.shape)
+    cos_sim = F.cosine_similarity(p_feats[:,None,:], z_feats[None,:,:], dim=-1)
+    # Mask out cosine similarity to itself
+    self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
+    cos_sim.masked_fill_(self_mask, -9e15)
+    # Find positive example -> batch_size//2 away from the original example
+    pos_mask = self_mask.roll(shifts=cos_sim.shape[0]//2, dims=0)
+    # InfoNCE loss
+    cos_sim = cos_sim / t
+    nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
+    nll = nll.mean()
+
+    return nll
+
+
+
+
+
 
 
 

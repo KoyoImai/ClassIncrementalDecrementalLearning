@@ -543,16 +543,50 @@ class TagFexMU(BaseLearner):
                         reduction="batchmean",
                     )
 
-        #=== 忘却損失（entropy maximization）を計算 ===#
+        # #=== 忘却損失（entropy maximization）を計算 ===#
+        # loss_forg = torch.tensor(0., device=self._device)
+
+        # # forget サンプルがあれば uniform への KL で entropy 最大化
+        # if mask_forget.any():
+        #     forget_logits = logits[mask_forget]  # [Bf, C]
+        #     log_p = F.log_softmax(forget_logits, dim=1)
+        #     C = log_p.size(1)
+        #     uniform = torch.full_like(log_p, 1.0 / C)
+        #     loss_forg = F.kl_div(log_p, uniform, reduction="batchmean")
+        
+
+        #=== 忘却損失（intra-class cosine similarity minimization）を計算 ===#
         loss_forg = torch.tensor(0., device=self._device)
 
-        # forget サンプルがあれば uniform への KL で entropy 最大化
         if mask_forget.any():
-            forget_logits = logits[mask_forget]  # [Bf, C]
-            log_p = F.log_softmax(forget_logits, dim=1)
-            C = log_p.size(1)
-            uniform = torch.full_like(log_p, 1.0 / C)
-            loss_forg = F.kl_div(log_p, uniform, reduction="batchmean")
+            # forget の embedding と targets を抽出
+            f_emb = embedding[mask_forget]   # [Bf, D]
+            f_tgt = targets[mask_forget]     # [Bf]
+
+            # cosine similarity 用に正規化
+            f_emb = F.normalize(f_emb, dim=1)
+
+            # forget クラスごとに「クラス内」cosine similarity を計算
+            loss_terms = []
+            for c in torch.unique(f_tgt):
+                idx = (f_tgt == c)
+                n = int(idx.sum().item())
+                if n < 2:
+                    continue  # 1個以下はクラス内類似度が定義できない
+
+                e = f_emb[idx]          # [n, D]
+                cos = e @ e.t()         # [n, n] （cosine similarity matrix）
+
+                # 対角（自己類似度）を除外して平均
+                diag = torch.eye(n, device=cos.device, dtype=torch.bool)
+                cos_off = cos.masked_select(~diag)  # [n*(n-1)]
+
+                # 「cosine similarity を最小化」→ 平均cosをそのまま loss にする
+                loss_terms.append(cos_off.mean())
+
+            if len(loss_terms) > 0:
+                loss_forg = torch.stack(loss_terms).mean()
+
 
         #=== aux（TagFexの合成） ===#
         # TagFex の元実装の考え方：known/total による自動係数（auto_kd_factor）

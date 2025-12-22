@@ -11,6 +11,16 @@ import os
 import numpy as np
 
 
+
+def _infer_num_convnets(state_dict):
+    idxs = []
+    for k in state_dict.keys():
+        if k.startswith("convnets."):
+            parts = k.split(".")
+            if len(parts) > 1 and parts[1].isdigit():
+                idxs.append(int(parts[1]))
+    return (max(idxs) + 1) if len(idxs) > 0 else None
+
 def _strip_module_prefix(state_dict: dict) -> dict:
     """Remove a leading 'module.' prefix (DataParallel) if present."""
     if not isinstance(state_dict, dict):
@@ -39,7 +49,7 @@ def _infer_num_classes_from_state_dict(state_dict: dict) -> int:
         "Could not infer #classes from checkpoint. Expected keys like 'fc.weight' or 'oldfc.weight'."
     )
 
-def _prepare_network_for_phase(model, data_manager: DataManager, phase_id: int):
+def _prepare_network_for_phase(model, data_manager: DataManager, phase_id: int, state_dict: dict = None):
     """Build the same dynamic architecture as training, up to `phase_id`.
 
     - For DER/TagFex/FOSTER etc, update_fc is called once per task.
@@ -58,10 +68,35 @@ def _prepare_network_for_phase(model, data_manager: DataManager, phase_id: int):
     # Methods with dynamic expansion typically keep a ModuleList called "convnets".
     # For those, we MUST call update_fc(task_total) per task.
     if hasattr(model._network, "convnets"):
+        is_foster = (model._network.__class__.__name__.lower().startswith("foster")
+                    or (state_dict is not None and "oldfc.weight" in state_dict))
+
+        if is_foster and state_dict is not None:
+            k = _infer_num_convnets(state_dict) or 1
+            fc_out = int(state_dict["fc.weight"].shape[0])
+            old_out = int(state_dict["oldfc.weight"].shape[0]) if "oldfc.weight" in state_dict else None
+
+            # --- 重要：FOSTER は checkpoint に合わせて update_fc 回数を決める ---
+            if k == 1:
+                model._network.update_fc(fc_out)
+                model._known_classes = fc_out
+            else:
+                # ほとんどのケースで k=2（compression 後 + 新規branch）になる想定
+                prev = old_out if old_out is not None else max(1, fc_out - data_manager.get_task_size(phase_id))
+                model._network.update_fc(prev)
+                model._network.update_fc(fc_out)
+                model._known_classes = prev
+
+            model._cur_task = phase_id
+            model._total_classes = fc_out
+            return
+
+        # --- DER/TagFex は従来どおり ---
         for total in totals:
             model._network.update_fc(total)
     else:
         model._network.update_fc(totals[-1])
+
 
     # Mirror training-time bookkeeping (helps for reporting).
     model._cur_task = phase_id
@@ -164,7 +199,6 @@ def _prototype_predict(
 
     return np.concatenate(y_pred), np.concatenate(y_true)
 
-
 def _evaluate_topk(y_pred: np.ndarray, y_true: np.ndarray, nb_old: int, increment: int, topk: int):
     """Standalone version of PyCIL's BaseLearner._evaluate (avoids signature drift)."""
     y_true = np.asarray(y_true)
@@ -195,8 +229,6 @@ def _evaluate_topk(y_pred: np.ndarray, y_true: np.ndarray, nb_old: int, incremen
     topk_acc = (y_pred.T[:topk] == np.tile(y_true, (topk, 1))).sum() * 100.0 / len(y_true)
     ret[f"top{topk}"] = np.around(topk_acc, decimals=2)
     return ret
-
-
 
 def evaluate(args):
     seed_list = copy.deepcopy(args["seed"])
@@ -244,6 +276,10 @@ def _add_retain_forget_metrics(accy: dict, y_pred: np.ndarray, y_true: np.ndarra
     accy["hmean"] = hmean
 
     return accy
+
+
+
+
 
 def _eval(args):
 
@@ -312,7 +348,8 @@ def _eval(args):
     state_dict = _strip_module_prefix(state_dict)
 
     # --- phase_id に応じて動的にネットワーク構造を組み立てる ---
-    _prepare_network_for_phase(model, data_manager, int(args["phase_id"]))
+    # _prepare_network_for_phase(model, data_manager, int(args["phase_id"]))
+    _prepare_network_for_phase(model, data_manager, int(args["phase_id"]), state_dict)
 
     # --- checkpoint と config の整合性チェック（参考情報） ---
     try:
@@ -431,7 +468,7 @@ def _eval(args):
     logging.info("PROTO test  top{}: {}".format(topk, proto_accy_test[f"top{topk}"]))
 
     # --- forget_classes を参照して retain/forget 指標を追加 ---
-    model.forget_classes = [0,1,10,11,20,21,30,31,40,41,50,51,60,61,70,71,80,81]
+    # model.forget_classes = [0,1,10,11,20,21,30,31,40,41,50,51,60,61,70,71,80,81]
     forget_set = {c for c in getattr(model, "forget_classes", []) if 0 <= c < num_classes}
 
     proto_accy_test = _add_retain_forget_metrics(proto_accy_test, y_pred_test, y_true_test, forget_set)

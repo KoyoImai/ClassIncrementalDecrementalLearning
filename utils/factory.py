@@ -86,9 +86,15 @@ def get_model(model_name, args):
     elif name == "der-mu":
         from models.der_mu import DERMU
         return DERMU(args)
+    elif name == "der-ince":
+        from models.der_ince import DERINCE
+        return DERINCE(args)
     elif name == "foster-mu":
         from models.foster_mu import FOSTERMU
         return FOSTERMU(args)
+    elif name == "foster-ince":
+        from models.foster_ince import FOSTERINCE
+        return FOSTERINCE(args)
     elif name == "tagfex-mu":
         from models.tagfex_mu import TagFexMU
         return TagFexMU(args)

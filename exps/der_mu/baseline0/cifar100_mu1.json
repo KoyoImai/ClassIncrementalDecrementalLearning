@@ -35,10 +35,14 @@
     "lambda_clf": 1.0,
     "lambda_aux": 1.0,
     "lambda_forg": 0.0,
-    "device": ["2"],
+    "device": ["3"],
     "seed": [1993],
     "num_workers": 8,
     "phase_id": 9,
     "pra_num_samples_per_class": 5,
-    "pra_alpha": 0.4
+    "pra_alpha": 0.4,
+    "proto_n": 5,
+    "proto_metric": "sqeuclidean",
+    "proto_l2norm": true,
+    "proto_batch_size": 128
 }
