@@ -92,6 +92,9 @@ def get_model(model_name, args):
     elif name == "foster-mu":
         from models.foster_mu import FOSTERMU
         return FOSTERMU(args)
+    elif name == "foster-mu2":
+        from models.foster_mu2 import FOSTERMU2
+        return FOSTERMU2(args)
     elif name == "foster-ince":
         from models.foster_ince import FOSTERINCE
         return FOSTERINCE(args)

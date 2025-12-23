@@ -102,8 +102,8 @@ class FOSTERMU2(BaseLearner):
 
         #=== 現在タスクの更新 ===#
         self._cur_task += 1
-        if self._cur_task > 1:
-            self._network = self._snet
+        # if self._cur_task > 1:
+        #     self._network = self._snet
         self._total_classes = self._known_classes + data_manager.get_task_size(
             self._cur_task
         )
@@ -172,6 +172,10 @@ class FOSTERMU2(BaseLearner):
 
         # 訓練を実行
         self._train(self.train_loader, self.test_loader)
+
+        # 生徒ネットを更新
+        if not self._cur_task == 0:
+            self._network = self._snet
 
         #=== 現在タスクまでの保持クラスを更新 ===#
         self._retain_classes = self._total_classes - len(self.forget_classes)
@@ -512,6 +516,8 @@ class FOSTERMU2(BaseLearner):
 
             #=== 記録用変数の初期化 ===#
             losses = 0.0
+            losses_kd = 0.0
+            losses_forg = 0.0
             correct, total = 0, 0
 
             #=== 1エポックの学習 ===#
@@ -526,16 +532,37 @@ class FOSTERMU2(BaseLearner):
                 # ----------------------------------------
                 # ② 損失計算
                 # ----------------------------------------
-                dark_logits = self._snet(inputs)["logits"]
+                s_out = self._snet(inputs)
+                dark_logits = s_out["logits"]
+                dark_feats = s_out["features"]
+
+                # --- teacher forward ---
                 with torch.no_grad():
-                    outputs = self._network(inputs)
-                    logits, old_logits, fe_logits = (
-                        outputs["logits"],
-                        outputs["old_logits"],
-                        outputs["fe_logits"],
+                    t_out = self._network(inputs)
+                    teacher_logits = t_out["logits"]
+
+                # --- forget/retain mask ---
+                mask_forget = self._make_forget_mask(targets)
+                mask_retain = ~mask_forget
+
+                # --- 蒸留損失 ---
+                loss_dark = torch.tensor(0.0, device=self._device)
+                if mask_retain.any():
+                    loss_dark = self.BKD(
+                        dark_logits[mask_retain],
+                        teacher_logits[mask_retain],
+                        self.args["T"],
                     )
-                loss_dark = self.BKD(dark_logits, logits, self.args["T"])
-                loss = loss_dark
+
+                # --- 忘却損失 ---
+                loss_fcos = torch.tensor(0.0, device=self._device)
+                # if mask_forget.any():
+                #     loss_fcos = self._forget_cosine_min_loss(
+                #         dark_feats[mask_forget],
+                #         targets[mask_forget],
+                #     )
+
+                loss = loss_dark + self.lambda_forg * loss_fcos
 
                 # ----------------------------------------
                 # ③ 最適化処理
@@ -557,20 +584,24 @@ class FOSTERMU2(BaseLearner):
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             if epoch % 5 == 0:
                 test_acc = self._compute_accuracy(self._snet, test_loader)
-                info = "SNet: Task {}, Epoch {}/{} => Loss {:.3f},  Train_accy {:.2f}, Test_accy {:.2f}".format(
+                info = "SNet: Task {}, Epoch {}/{} => Loss {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f},  Train_accy {:.2f}, Test_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     self.args["compression_epochs"],
                     losses / len(train_loader),
+                    losses_kd / len(train_loader),
+                    losses_forg / len(train_loader),
                     train_acc,
                     test_acc,
                 )
             else:
-                info = "SNet: Task {}, Epoch {}/{} => Loss {:.3f},  Train_accy {:.2f}".format(
+                info = "SNet: Task {}, Epoch {}/{} => Loss {:.3f}, Loss_kd {:.3f}, Loss_forg {:.3f},  Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     self.args["compression_epochs"],
                     losses / len(train_loader),
+                    losses_kd / len(train_loader),
+                    losses_forg / len(train_loader),
                     train_acc,
                 )
             prog_bar.set_description(info)
@@ -617,6 +648,7 @@ class FOSTERMU2(BaseLearner):
             outputs["fe_logits"],
             outputs["old_logits"].detach(),
         )
+        features = outputs["features"]
 
         #=== forget / retain クラスを分割するためのマスク作成 ===#
         # バッチサイズ
@@ -678,15 +710,65 @@ class FOSTERMU2(BaseLearner):
 
         #=== 忘却損失を計算 ===#
         loss_forg = torch.tensor(0., device=self._device)
+        loss_forg2 = torch.tensor(0., device=self._device)
 
+        if mask_forget.any():
+            loss_forg = self._forget_cosine_min_loss(
+                features[mask_forget],
+                targets[mask_forget],
+            )
+        
         if mask_forget.any():
             forget_logits = logits[mask_forget]            # [Bf, C]
             log_p = F.log_softmax(forget_logits, dim=1)
             num_classes = log_p.size(1)
             uniform = torch.full_like(log_p, 1.0 / num_classes)
-            loss_forg = F.kl_div(log_p, uniform, reduction="batchmean")
+            loss_forg2 = F.kl_div(log_p, uniform, reduction="batchmean")
+
+        loss_forg += loss_forg2 * 0.1
 
         return logits, loss_clf, loss_fe, loss_kd, loss_forg
+
+    def _make_forget_mask(self, targets: torch.Tensor) -> torch.Tensor:
+        B = targets.shape[0]
+        forget_list = sorted(set(getattr(self, "forget_classes", [])))
+
+        if (self._cur_task == 0) or (len(forget_list) == 0):
+            return torch.zeros(B, device=targets.device, dtype=torch.bool)
+
+        forget_t = torch.as_tensor(forget_list, device=targets.device, dtype=targets.dtype)
+        return torch.isin(targets, forget_t)
+
+
+    def _forget_cosine_min_loss(self, features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        忘却クラス c に属するサンプルに対して、
+        同一クラス内の cosine similarity を最小化する loss。
+        features: [Bf, D], targets: [Bf]
+        """
+        if features.ndim != 2:
+            features = features.view(features.size(0), -1)
+
+        feats = F.normalize(features, dim=1)
+        loss = torch.tensor(0.0, device=features.device)
+        n_cls = 0
+
+        for c in targets.unique():
+            idx = (targets == c)
+            n = int(idx.sum().item())
+            if n < 2:
+                continue
+
+            f = feats[idx]               # [n, D]
+            sim = f @ f.t()              # [n, n]
+            sim_sum = sim.sum() - sim.diag().sum()
+            loss_c = sim_sum / (n * (n - 1))   # 平均ペア類似度
+            loss = loss + loss_c
+            n_cls += 1
+
+        if n_cls > 0:
+            loss = loss / n_cls
+        return loss
 
     def BKD(self, pred, soft, T):
         pred = torch.log_softmax(pred / T, dim=1)
@@ -855,7 +937,7 @@ class FOSTERMU2(BaseLearner):
             mean = _calc_mean_from_appendent(selected_exemplars, exemplar_targets)
             _class_means[class_idx, :] = mean
 
-        self._class_means = _class_means
+        # self._class_means = _class_means
 
     def _reduce_exemplar(self, data_manager, m):
         logging.info("Reducing exemplars...({} per classes)".format(m))
@@ -869,7 +951,7 @@ class FOSTERMU2(BaseLearner):
         dummy_targets = copy.deepcopy(self._targets_memory)
 
         #=== リプレイバッファの内容を空に初期化 ===#
-        self._class_means = np.zeros((self._total_classes, self.feature_dim))
+        # self._class_means = np.zeros((self._total_classes, self.feature_dim))
         self._data_memory = np.array([])
         self._targets_memory = np.array([])
 
@@ -932,7 +1014,7 @@ class FOSTERMU2(BaseLearner):
             mean = np.mean(vectors, axis=0)
             mean = mean / np.linalg.norm(mean)
 
-            self._class_means[class_idx, :] = mean
+            # self._class_means[class_idx, :] = mean
 
     def _construct_exemplar(self, data_manager, m):
 
@@ -1013,13 +1095,10 @@ class FOSTERMU2(BaseLearner):
             mean = np.mean(vectors, axis=0)
             mean = mean / np.linalg.norm(mean)
 
-            self._class_means[class_idx, :] = mean
+            # self._class_means[class_idx, :] = mean
 
 
 
-    #---------------------------------------------------------------------------------------
-    # 評価関連の処理
-    #---------------------------------------------------------------------------------------
     #---------------------------------------------------------------------------------------
     # 評価関連の処理
     #---------------------------------------------------------------------------------------

@@ -376,7 +376,9 @@ def _eval(args):
     # (任意) forget_classes を保存しているチェックポイントなら復元
     if isinstance(ckpt, dict) and "forget_classes" in ckpt:
         model.forget_classes = ckpt["forget_classes"]
-
+    else:
+        assert False
+        
     # --- dataloader 構築 ---
     num_classes = int(model._total_classes)
     eval_bs = int(args.get("batch_size", 128))
