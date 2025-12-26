@@ -1,5 +1,5 @@
 {
-    "log": "baseline0",
+    "log": "grad_conf",
     "prefix": "cidl0",
     "dataset": "cifar100",
     "memory_size": 2000,
@@ -18,7 +18,7 @@
                    [60,61],
                    [70,71],
                    [80,81]],
-    "model_name": "der-mu",
+    "model_name": "icarl-mu",
     "convnet_type": "resnet32",
     "batch_size": 128,
     "init_epoch": 200,
@@ -33,16 +33,22 @@
     "weight_decay": 2e-4,
     "T": 2,
     "lambda_clf": 1.0,
-    "lambda_aux": 1.0,
-    "lambda_forg": 2.0,
+    "lambda_kd": 1.0,
+    "lambda_forg": 1.0,
     "device": ["1"],
     "seed": [1993],
     "num_workers": 8,
+    "grad_conflict": true,
+    "grad_conflict_interval": 1,
+    "grad_conflict_include_fc": false,
+    "grad_conflict_granular": true,
+    "log_dir": "grad_conf",
     "phase_id": 9,
-    "pra_num_samples_per_class": 50,
-    "pra_alpha": 0.8,
+    "pra_num_samples_per_class": 5,
+    "pra_alpha": 1,
     "proto_n": 5,
     "proto_metric": "sqeuclidean",
     "proto_l2norm": true,
-    "proto_batch_size": 128
+    "proto_batch_size": 128   
 }
+

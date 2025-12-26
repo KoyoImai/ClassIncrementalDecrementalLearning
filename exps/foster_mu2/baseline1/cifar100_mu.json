@@ -45,7 +45,7 @@
     "beta1":0.96,
     "pra_num_samples_per_class": 5,
     "pra_alpha": 1,
-    "phase_id": 1,
+    "phase_id": 9,
     "proto_n": 5,
     "proto_metric": "sqeuclidean",
     "proto_l2norm": true,

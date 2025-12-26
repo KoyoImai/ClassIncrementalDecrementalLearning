@@ -83,6 +83,9 @@ def get_model(model_name, args):
     elif name == "icarl-mu":
         from models.icarl_mu import iCaRLMU
         return iCaRLMU(args)
+    elif name == "icarl-mu2":
+        from models.icarl_mu2 import iCaRLMU2
+        return iCaRLMU2(args)
     elif name == "der-mu":
         from models.der_mu import DERMU
         return DERMU(args)

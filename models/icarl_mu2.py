@@ -1,7 +1,8 @@
-import os
+
 import copy
 import logging
 import numpy as np
+import os
 from tqdm import tqdm
 import torch
 from torch import nn
@@ -15,6 +16,7 @@ from utils.inc_net import CosineIncrementalNet
 from utils.toolkit import target2onehot, tensor2numpy
 
 from utils.grad_conflict import GradConflictLogger, select_named_params
+
 
 EPSILON = 1e-8
 
@@ -35,7 +37,7 @@ EPSILON = 1e-8
 # T = 2
 
 
-class iCaRLMU(BaseLearner):
+class iCaRLMU2(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
@@ -49,6 +51,26 @@ class iCaRLMU(BaseLearner):
 
         # 学習ハイパラ（全タスク共通）
         self.batch_size = args["batch_size"]
+
+        # ------------------------------------------------------------------
+        # Replay sampling (NEW)
+        #  - これまで: DataLoader の dataset に replay buffer を混ぜる
+        #  - これから: 各 iteration で replay buffer から直接サンプルする
+        #
+        # ユーザ指定がなければ、従来の「混ぜ込み比率」を近似するため、
+        #   replay batch size を (memory_len / (new_len + memory_len)) * batch_size
+        # から自動決定する（task>0 のみ）。
+        # ------------------------------------------------------------------
+        self.replay_retain_batch_size = args.get("replay_retain_batch_size", None)
+        self.replay_forget_batch_size = args.get("replay_forget_batch_size", 0)
+        self.replay_with_replacement = bool(args.get("replay_with_replacement", True))
+
+        # 内部状態（taskごとに更新）
+        self._replay_dataset = None              # DummyDataset over (data_memory, targets_memory) w/ train transforms
+        self._replay_targets_np = None           # np.ndarray, shape [M]
+        self._replay_indices_retain = None       # np.ndarray of indices into replay dataset
+        self._replay_indices_forget = None       # np.ndarray of indices into replay dataset
+        self._batch_size_new = self.batch_size   # current-task DataLoader batch size (excluding replay)
         
         #　学習ハイパラ（初期タスク）
         self.init_epoch = args["init_epoch"]
@@ -78,6 +100,27 @@ class iCaRLMU(BaseLearner):
         # その他パラメータ
         self.num_workers = args["num_workers"]
 
+        # ------------------------------------------------------------------
+        # Replay sampling (変更点１＆２)
+        #  - 旧: DataLoaderのdatasetにメモリをappendして混ぜる
+        #  - 新: 毎iterationでリプレイバッファから直接サンプルを取得して学習
+        #
+        # total batch size は従来どおり self.batch_size を基準とし、
+        #   new_batch + replay_retain_batch + replay_forget_batch = total
+        # を満たすように構成する。
+        # ------------------------------------------------------------------
+        self.replay_retain_batch_size = args.get(
+            "replay_retain_batch_size", args.get("replay_batch_size", None)
+        )
+        self.replay_forget_batch_size = args.get("replay_forget_batch_size", 0)
+
+        # リプレイ用 dataset（train transform 適用済み）
+        self._replay_dataset = None
+        self._replay_targets = None  # np.ndarray
+        self._replay_indices_all = None
+        self._replay_indices_retain = None
+        self._replay_indices_forget = None
+
         # どこかで1回だけ作る（__init__ か _train の冒頭が楽）
         if not hasattr(self, "_gc_logger"):
             if self.args.get("grad_conflict", False):
@@ -87,7 +130,6 @@ class iCaRLMU(BaseLearner):
                 self._gc_include_fc = bool(self.args.get("grad_conflict_include_fc", False))
             else:
                 self._gc_logger = None
-
 
 
     #---------------------------------------------------------------------------------------
@@ -145,19 +187,27 @@ class iCaRLMU(BaseLearner):
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
 
         #=== 訓練用データセットの作成 ===#
+        # 変更点１:
+        #   これまで: appendent=self._get_memory() で replay buffer を dataset に混ぜる
+        #   これから: dataset は "現在タスクのデータのみ" とし、replay は iteration ごとに直接サンプル
         train_dataset = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
             source="train",
             mode="train",
-            appendent=self._get_memory(),
         )
 
+        # replay 用 dataset / index pool を準備（task>0 で memory があるときのみ）
+        self._prepare_replay_sampling(data_manager)
+        # replay batch size を自動決定（ユーザ指定がなければ）
+        self._auto_configure_replay_batch_sizes(new_len=len(train_dataset))
+
         #=== 訓練用データローダーの作成 ===#
+        # replay 分を除いた "現在タスクデータ" の batch size
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=self.batch_size,
+            batch_size=self._batch_size_new,
             shuffle=True,
-            num_workers=self.num_workers
+            num_workers=self.num_workers,
         )
 
         #=== テスト用データセットの作成 ===#
@@ -353,9 +403,37 @@ class iCaRLMU(BaseLearner):
                 targets = targets.to(self._device)
 
                 # ----------------------------------------
-                # ② 損失計算
+                # ② Replay buffer から iteration ごとに直接サンプル
+                #    変更点１/２:
+                #      - retain / forget を別々に指定して取り出せる
                 # ----------------------------------------
-                logits, loss_clf, loss_kd, loss_forg = self.compute_loss(inputs, targets)
+                replay_inputs = []
+                replay_targets = []
+
+                # retain replay
+                if self.replay_retain_batch_size and self.replay_retain_batch_size > 0:
+                    rb = self.sample_replay_retain(self.replay_retain_batch_size)
+                    if rb is not None:
+                        replay_inputs.append(rb[0])
+                        replay_targets.append(rb[1])
+
+                # forget replay（必要なら）
+                if self.replay_forget_batch_size and self.replay_forget_batch_size > 0:
+                    fb = self.sample_replay_forget(self.replay_forget_batch_size)
+                    if fb is not None:
+                        replay_inputs.append(fb[0])
+                        replay_targets.append(fb[1])
+
+                if len(replay_inputs) > 0:
+                    inputs_all = torch.cat([inputs] + replay_inputs, dim=0)
+                    targets_all = torch.cat([targets] + replay_targets, dim=0)
+                else:
+                    inputs_all, targets_all = inputs, targets
+
+                # ----------------------------------------
+                # ③ 損失計算
+                # ----------------------------------------
+                logits, loss_clf, loss_kd, loss_forg = self.compute_loss(inputs_all, targets_all)
                 loss = loss_clf * self.lambda_clf + loss_kd * self.lambda_kd +loss_forg * self.lambda_forg
 
                 # ----------------------------------------
@@ -363,7 +441,7 @@ class iCaRLMU(BaseLearner):
                 # ----------------------------------------
                 optimizer.zero_grad()
 
-                 # step は epoch / i から作る（例）
+                # step は epoch / i から作る（例）
                 global_step = epoch * len(train_loader) + i
 
                 if self._gc_logger is not None and (global_step % self._gc_interval == 0):
@@ -406,8 +484,8 @@ class iCaRLMU(BaseLearner):
                 # ⑤ 訓練精度の計算
                 # ----------------------------------------
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
+                correct += preds.eq(targets_all.expand_as(preds)).cpu().sum()
+                total += len(targets_all)
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
@@ -507,6 +585,166 @@ class iCaRLMU(BaseLearner):
 
 
         return logits ,loss_clf, loss_kd, loss_forg
+
+    #---------------------------------------------------------------------------------------
+    # Replay sampling (変更点１＆２)
+    #---------------------------------------------------------------------------------------
+    def _prepare_replay_sampling(self, data_manager):
+        """replay buffer を iteration ごとにサンプルするための準備。
+
+        - 変更点１: DataLoader の dataset に replay buffer を混ぜない
+        - 変更点２: replay buffer から retain / forget を別々に指定して取り出せるようにする
+        """
+        mem = self._get_memory()
+        if mem is None:
+            self._replay_dataset = None
+            self._replay_targets_np = None
+            self._replay_indices_retain = None
+            self._replay_indices_forget = None
+            return
+
+        mem_data, mem_targets = mem
+        if mem_targets is None or len(mem_targets) == 0:
+            self._replay_dataset = None
+            self._replay_targets_np = None
+            self._replay_indices_retain = None
+            self._replay_indices_forget = None
+            return
+
+        # train-time transform を適用するために DataManager から DummyDataset を作る
+        self._replay_dataset = data_manager.get_dataset(
+            [], source="train", mode="train", appendent=(mem_data, mem_targets)
+        )
+        self._replay_targets_np = np.asarray(mem_targets)
+
+        # retain / forget の pool を作る
+        if len(getattr(self, "forget_classes", [])) == 0:
+            self._replay_indices_forget = np.asarray([], dtype=np.int64)
+            self._replay_indices_retain = np.arange(len(self._replay_targets_np), dtype=np.int64)
+        else:
+            forget_set = np.asarray(sorted(set(self.forget_classes)), dtype=self._replay_targets_np.dtype)
+            mask_forget = np.isin(self._replay_targets_np, forget_set)
+            self._replay_indices_forget = np.where(mask_forget)[0].astype(np.int64)
+            self._replay_indices_retain = np.where(~mask_forget)[0].astype(np.int64)
+        
+
+        # assert False
+
+    def _auto_configure_replay_batch_sizes(self, new_len: int):
+        """replay batch size を自動決定し、DataLoader 側の batch size を調整する。
+
+        total batch size は self.batch_size（従来と同じ）を基準として、
+          new_batch + replay_retain_batch + replay_forget_batch = total
+        となるようにする。
+
+        ユーザが `replay_retain_batch_size` を指定していれば、それを優先する。
+        """
+        # mem_len = int(self.exemplar_size)
+        mem_len = int(self._targets_memory.shape[0])
+
+        # task0 または memory がない場合は replay なし
+        if self._cur_task == 0 or mem_len == 0:
+            # self.replay_retain_batch_size = 0
+            # self.replay_forget_batch_size = 0
+            self._batch_size_new = int(self.batch_size)
+            return
+
+        # retain replay size（未指定なら従来の混ぜ込み比率を近似）
+        if self.replay_retain_batch_size is None:
+            total_len = max(1, int(new_len) + mem_len)
+            exp_replay = int(round(float(self.batch_size) * mem_len / total_len))
+            if exp_replay <= 0:
+                exp_replay = 1
+            self.replay_retain_batch_size = exp_replay
+
+        # 型を整える
+        self.replay_retain_batch_size = int(self.replay_retain_batch_size)
+        self.replay_forget_batch_size = int(self.replay_forget_batch_size)
+        # print("self.replay_retain_batch_size: ", self.replay_retain_batch_size)
+        # print("self.replay_forget_batch_size: ", self.replay_forget_batch_size)
+        # assert False
+
+        # batch size が破綻しないように clamp
+        if self.replay_forget_batch_size < 0:
+            self.replay_forget_batch_size = 0
+        if self.replay_retain_batch_size < 0:
+            self.replay_retain_batch_size = 0
+
+        if self.replay_retain_batch_size + self.replay_forget_batch_size >= self.batch_size:
+            # new_batch を最低 1 確保
+            max_total_replay = self.batch_size - 1
+            # forget を優先して retain を削る（不要なら逆でもOK）
+            self.replay_forget_batch_size = min(self.replay_forget_batch_size, max_total_replay)
+            self.replay_retain_batch_size = max(0, max_total_replay - self.replay_forget_batch_size)
+
+        self._batch_size_new = int(self.batch_size) - self.replay_retain_batch_size - self.replay_forget_batch_size
+        self._batch_size_new = max(1, self._batch_size_new)
+
+        logging.info(
+            f"Replay config (task={self._cur_task}): new_batch={self._batch_size_new}, "
+            f"replay_retain_batch={self.replay_retain_batch_size}, replay_forget_batch={self.replay_forget_batch_size}"
+        )
+
+    def _sample_replay_from_pool(self, pool_indices: np.ndarray, n: int):
+        """pool_indices から n 個サンプルして (inputs, targets) を返す。"""
+        if self._replay_dataset is None or self._replay_targets_np is None:
+            return None
+        if n is None or int(n) <= 0:
+            return None
+        if pool_indices is None or len(pool_indices) == 0:
+            return None
+
+        n = int(n)
+        pool_indices = np.asarray(pool_indices, dtype=np.int64)
+        replace = self.replay_with_replacement or (len(pool_indices) < n)
+        chosen = np.random.choice(pool_indices, size=n, replace=replace)
+
+        imgs = []
+        labs = []
+        for idx in chosen:
+            item = self._replay_dataset[int(idx)]
+            # DummyDataset(aug=1) : (idx, image, label)
+            # aug>1 の場合: (idx, img1, img2, ..., label) になるので最初の view を取る
+            label = item[-1]
+            img = item[1]
+            imgs.append(img)
+            labs.append(label)
+
+        inputs = torch.stack(imgs, dim=0).to(self._device, non_blocking=True)
+        targets = torch.as_tensor(labs, device=self._device)
+        return inputs, targets
+
+    def sample_replay_retain(self, n: int, retain_classes: list = None):
+        """replay buffer から retain クラスのみをサンプルする。
+
+        Args:
+            n: サンプル数
+            retain_classes: 取り出したい retain class id の list（None なら retain pool 全体）
+        """
+        if self._replay_indices_retain is None:
+            return None
+        pool = self._replay_indices_retain
+        if retain_classes is not None and self._replay_targets_np is not None:
+            retain_classes = np.asarray(retain_classes, dtype=self._replay_targets_np.dtype)
+            mask = np.isin(self._replay_targets_np[pool], retain_classes)
+            pool = pool[mask]
+        return self._sample_replay_from_pool(pool, n)
+
+    def sample_replay_forget(self, n: int, forget_classes: list = None):
+        """replay buffer から forget クラスのみをサンプルする。
+
+        Args:
+            n: サンプル数
+            forget_classes: 取り出したい forget class id の list（None なら forget pool 全体）
+        """
+        if self._replay_indices_forget is None:
+            return None
+        pool = self._replay_indices_forget
+        if forget_classes is not None and self._replay_targets_np is not None:
+            forget_classes = np.asarray(forget_classes, dtype=self._replay_targets_np.dtype)
+            mask = np.isin(self._replay_targets_np[pool], forget_classes)
+            pool = pool[mask]
+        return self._sample_replay_from_pool(pool, n)
 
     #---------------------------------------------------------------------------------------
     # リプレイバッファの構築

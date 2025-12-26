@@ -72,6 +72,8 @@ def _eval(args):
     #=== 学習済みパラメータの読み込み ===#
     ckpt_dir  = build_ckpt_dir(args)
     ckpt_path = f"{ckpt_dir}/phase_{args['phase_id']}.pkl"
+    # ckpt_path = f"/home/kouyou/ContinualLearning/repexp/PyCIL/logs/der-mu/baseline0/cifar100/0/10/reproduce_1993_resnet32/phase_5_cos_unlearn_maskft[50, 51]_v6.pth"
+    # ckpt_path = f"logs/der-mu/baseline0/cifar100/0/10/reproduce_1993_resnet32/phase_5.pkl"
 
     ckpt = torch.load(ckpt_path, map_location=model._device)
 

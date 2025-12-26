@@ -39,7 +39,9 @@ def _train(args):
     #=== log デイレク取りを作成 ===#
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-
+    
+    args["log_dir"] = log_dir
+ 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(filename)s] => %(message)s",
