@@ -92,6 +92,9 @@ def get_model(model_name, args):
     elif name == "der-ince":
         from models.der_ince import DERINCE
         return DERINCE(args)
+    elif name == "der-mu-prune":
+        from models.der_mu_prune import DERMUPrune
+        return DERINCE(args)
     elif name == "foster-mu":
         from models.foster_mu import FOSTERMU
         return FOSTERMU(args)
